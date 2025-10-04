@@ -188,6 +188,10 @@ def worker_process(process_id: int, config: Config, batch_queue: mp.Queue, buffe
                 process_stats['annotation_time'] += time.time() - ann_start
 
         # Synchronize all processes before sampling
+        # I am assuming that all processes will need to reach this point before we can proceed to sampling
+        # This is to ensure that all processes have annotated their batches before any process starts sampling
+        # Because if one process starts sampling before others have annotated, then the buffer might be empty or not fully populated
+        # and the sampling will not be effective
         try:
             barrier.wait()
         except BrokenBarrierError:
