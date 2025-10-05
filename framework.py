@@ -334,7 +334,8 @@ def benchmark_scaling():
         n_annotation_rounds=3,
         m_sampling_rounds=2,
         buffer_size=500,
-        overwrite_policy="age"
+        overwrite_policy="age",
+        device="cuda"
     )
     
     # process_counts = [1, 2, 4, 8]
@@ -349,7 +350,8 @@ def benchmark_scaling():
             n_annotation_rounds=base_config.n_annotation_rounds,
             m_sampling_rounds=base_config.m_sampling_rounds,
             buffer_size=base_config.buffer_size,
-            overwrite_policy=base_config.overwrite_policy
+            overwrite_policy=base_config.overwrite_policy,
+            device=base_config.device
         )
         
         result = run_framework(config)
