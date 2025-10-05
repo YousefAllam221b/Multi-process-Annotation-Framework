@@ -1,10 +1,10 @@
-import torch
-import torch.multiprocessing as mp
-from torch.utils.data import Dataset, DataLoader
+from torch import Tensor, rand, randn, stack, from_numpy, tensor
+import multiprocessing as mp
+from torch.utils.data import Dataset, DataLoader, Subset
 import numpy as np
 import time
 from dataclasses import dataclass
-from typing import  Tuple
+from typing import Tuple
 from threading import BrokenBarrierError
 
 @dataclass
@@ -21,8 +21,8 @@ class Config:
 
 class DummyDataset(Dataset):
     """Simple dataset for demonstration"""
-    def __init__(self, size: int):
-        self.data = torch.randn(size, 10)
+    def __init__(self, size: int, device: str = "cpu"):
+        self.data = randn(size, 10, device=device)
         self.size = size
         
     def __len__(self):
@@ -37,8 +37,8 @@ class DummyModel:
     def __init__(self, device: str = "cpu"):
         self.device = device
         
-    def annotate(self, batch: torch.Tensor) -> torch.Tensor:
-        return torch.rand(batch.size(0))
+    def annotate(self, batch: Tensor) -> Tensor:
+        return rand(batch.size(0))
 
 # Todo: consider combining the annotations with the data in the dataset
 class CentralBuffer:
@@ -54,7 +54,7 @@ class CentralBuffer:
         self.current_time = manager.Value('i', 0)
         
     # Works
-    # def add(self, data: torch.Tensor, annotations: torch.Tensor):
+    # def add(self, data: Tensor, annotations: Tensor):
     #     """Add annotated data to buffer"""
     #     batch = [(data[i].numpy(), annotations[i].item()) for i in range(data.size(0))]
 
@@ -81,7 +81,7 @@ class CentralBuffer:
                 
     #             self.current_time.value += 1
     
-    def add(self, data: torch.Tensor, annotations: torch.Tensor):
+    def add(self, data: Tensor, annotations: Tensor):
         """Add annotated data to buffer in batch"""
         with self.lock:
             remaining_space = self.max_size - len(self.buffer)
@@ -108,7 +108,7 @@ class CentralBuffer:
                     self.timestamps[idx] = self.current_time.value
                     self.current_time.value += 1
 
-    def sample(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def sample(self, batch_size: int, device: str = "cpu") -> Tuple[Tensor, Tensor]:
         """Sample from buffer based on annotation probability"""
         with self.lock:
             if len(self.buffer) == 0:
@@ -128,10 +128,10 @@ class CentralBuffer:
             indices = np.random.choice(len(self.buffer), size=n_samples, p=probs, replace=False)
             
             # Convert back to torch tensors
-            sampled_data = torch.stack([torch.from_numpy(np.array(self.buffer[i])) for i in indices])
-            sampled_annotations = torch.tensor([self.annotations[i] for i in indices])
+            sampled_data = stack([from_numpy(np.array(self.buffer[i])) for i in indices])
+            sampled_annotations = tensor([self.annotations[i] for i in indices])
             
-            return sampled_data, sampled_annotations
+            return sampled_data.to(device), sampled_annotations.to(device)
     
     def size(self):
         """Get current buffer size"""
@@ -139,11 +139,21 @@ class CentralBuffer:
             return len(self.buffer)
 
 
-def worker_process(process_id: int, config: Config, batch_queue: mp.Queue, buffer: CentralBuffer, 
+def worker_process(process_id: int, config: Config, buffer: CentralBuffer, 
                    barrier: mp.Barrier, stats_queue: mp.Queue): # type: ignore
     """Worker process for annotation and sampling"""
     # Create model for process
     model = DummyModel(device=config.device)
+    
+    # Approach using a subset of the dataset for each process
+    # Since, according to my understanding of the workflow, the data would be distributed across processes
+    # where all processes would be working on different parts of the dataset concurrently
+    dataset = DummyDataset(config.dataset_size, device=config.device)
+
+    # Create dataloader for this process
+    indices = list(range(process_id, len(dataset), config.num_processes))
+    subset = Subset(dataset, indices)
+    dataloader = DataLoader(subset, batch_size=config.batch_size, shuffle=False)
     
     process_stats = {
         'process_id': process_id,
@@ -155,37 +165,41 @@ def worker_process(process_id: int, config: Config, batch_queue: mp.Queue, buffe
     start_time = time.time()
 
     processed_batches = 0
-    finished = False
+    # finished = False
     
     # Repeat until dataset is processed (all batches consumed)
-    while True:
+    for batch, _ in dataloader:
         # Phase 1: 
-        batch = None
+        
+        # Approach using a shared queue for batches
+        # replace with subset approach
+        
+        # batch = None
 
         # Get next batch from shared queue
-        try:
-            batch = batch_queue.get(timeout=0.1)
-        except:
-            print(f"Process {process_id} - no more batches available")
-            batch = None
+        # try:
+        #     batch = batch_queue.get(timeout=0.1)
+        # except:
+        #     print(f"Process {process_id} - no more batches available")
+        #     batch = None
 
-        if batch is None:
-            finished = True
+        # if batch is None:
+        #     finished = True
 
         # Annotation (repeat n times)
-        if not finished:
-            for annotation_round in range(config.n_annotation_rounds):
-                
-                ann_start = time.time()
-                
-                # Annotate batch
-                batch = batch.to(config.device)
-                annotations = model.annotate(batch)
-                
-                # Add to central buffer
-                buffer.add(batch.cpu(), annotations.cpu())
-                
-                process_stats['annotation_time'] += time.time() - ann_start
+        # if not finished:
+        for annotation_round in range(config.n_annotation_rounds):
+            
+            ann_start = time.time()
+            
+            # Annotate batch
+            batch = batch.to(config.device)
+            annotations = model.annotate(batch)
+            
+            # Add to central buffer
+            buffer.add(batch.cpu(), annotations.cpu())
+            
+            process_stats['annotation_time'] += time.time() - ann_start
 
         # Synchronize all processes before sampling
         # I am assuming that all processes will need to reach this point before we can proceed to sampling
@@ -198,30 +212,29 @@ def worker_process(process_id: int, config: Config, batch_queue: mp.Queue, buffe
             print(f"Process {process_id} - barrier broken after annotation")
         
         # Phase 2: Sampling (repeat m times)
-        if not finished:
-            for sampling_round in range(config.m_sampling_rounds):
-                sampling_start = time.time()
-                
-                # Sample from buffer
-                sampled_data, _ = buffer.sample(config.batch_size)
-                
-                if sampled_data is not None:
-                    # In real scenario, would train model here
-                    pass
-                
-                process_stats['sampling_time'] += time.time() - sampling_start
+        # if not finished:
+        for sampling_round in range(config.m_sampling_rounds):
+            sampling_start = time.time()
+            
+            # Sample from buffer
+            sampled_data, _ = buffer.sample(config.batch_size)
+            
+            if sampled_data is not None:
+                # In real scenario, would train model here
+                pass
+            
+            process_stats['sampling_time'] += time.time() - sampling_start
         
-        if not finished:
-            processed_batches += 1
+        # if not finished:
+        processed_batches += 1
         
         # Synchronize before next annotation round
         try:
             barrier.wait()
         except BrokenBarrierError:
             print(f"Process {process_id} - barrier broken after sampling")
-    
-        if batch_queue.empty():
-            break
+        # if batch_queue.empty():
+        #     break
         
     print(f"Process {process_id} done. Processed {processed_batches} batches.")
     process_stats['total_time'] = time.time() - start_time
@@ -231,6 +244,7 @@ def worker_process(process_id: int, config: Config, batch_queue: mp.Queue, buffe
 
 def run_framework(config: Config) -> dict:
     """Run the complete framework"""
+    print()
     print(f"\n{'='*60}")
     print(f"Running with {config.num_processes} processes")
     print(f"{'='*60}")
@@ -247,21 +261,26 @@ def run_framework(config: Config) -> dict:
     # Queue for collecting statistics
     stats_queue = mp.Queue()
     
+    # Approach using a shared queue for batches
+    # Its slower and assumes that all data can fit in memory at once
+    # Using a subset of the dataset for each process is more scalable and realistic
+    # since each process works on its own part of the dataset concurrently
+    
     # Create dataset
-    dataset = DummyDataset(config.dataset_size)
-    dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=False)
+    # dataset = DummyDataset(config.dataset_size)
+    # dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=False)
     
-    # Create shared queue for batches
-    batch_queue = mp.Queue()
+    # # Create shared queue for batches
+    # batch_queue = mp.Queue()
     
-    # Populate the batch queue with all batches
-    print(f"Loading {len(dataloader)} batches into queue...")
-    for batch, _ in dataloader:
-        batch_queue.put(batch)
+    # # Populate the batch queue with all batches
+    # print(f"Loading {len(dataloader)} batches into queue...")
+    # for batch, _ in dataloader:
+    #     batch_queue.put(batch)
     
-    # Add sentinel values to signal end of data
-    for _ in range(len(dataloader) % config.num_processes):
-        batch_queue.put(None)
+    # # Add sentinel values to signal end of data
+    # for _ in range(len(dataloader) % config.num_processes):
+    #     batch_queue.put(None)
 
     # Start worker processes
     processes = []
@@ -269,7 +288,7 @@ def run_framework(config: Config) -> dict:
     
     for i in range(config.num_processes):
         p = mp.Process(target=worker_process, 
-                      args=(i, config, batch_queue, buffer, barrier, stats_queue))
+                      args=(i, config, buffer, barrier, stats_queue))
         p.start()
         processes.append(p)
     
@@ -309,11 +328,11 @@ def benchmark_scaling():
     print("="*60)
     
     base_config = Config(
-        dataset_size=20000,
+        dataset_size=10000,
         batch_size=64,
         num_processes=1,
-        n_annotation_rounds=5,
-        m_sampling_rounds=3,
+        n_annotation_rounds=3,
+        m_sampling_rounds=2,
         buffer_size=500,
         overwrite_policy="age"
     )
